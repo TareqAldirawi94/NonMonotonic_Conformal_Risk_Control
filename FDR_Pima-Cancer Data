@@ -1,0 +1,560 @@
+# Conformal Risk Control 
+# Repeated simulations to estimate E[L_{n+1}(λ̂)]
+
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(randomForest, ggplot2, dplyr, mlbench, tidyr)
+
+set.seed(123)
+
+# ===========================
+# PARAMETERS
+# ===========================
+N_REPLICATIONS <- 500
+TRAIN_PROP <- 0.6
+CAL_PROP <- 0.3
+TEST_PROP <- 0.1
+
+lambda_grid <- seq(0, 1, length.out = 50)
+m <- length(lambda_grid)
+alpha <- 0.2
+B <- 1.0
+
+# ===========================
+# FDR LOSS FUNCTION
+# ===========================
+# L_i^{FDR}(λ) = 1 - |Y_i ∩ C_λ(X_i)| / |C_λ(X_i)|
+# where C_λ(X_i) = {y : P(y|X_i) ≥ 1-λ}
+
+compute_fdr_loss <- function(probs_row, true_label, lambda, class_names) {
+  threshold <- 1 - lambda
+  pred_set <- class_names[probs_row >= threshold]
+  set_size <- length(pred_set)
+  coverage <- as.numeric(true_label %in% pred_set)
+  
+  if (set_size == 0) {
+    return(1.0)
+  } else {
+    return(1 - coverage / set_size)
+  }
+}
+
+# ===========================
+# LOAD DATA
+# ===========================
+data(PimaIndiansDiabetes)
+df <- PimaIndiansDiabetes
+class_names <- c("neg", "pos")
+
+# ===========================
+# SIMULATION LOOP
+# ===========================
+results <- data.frame(
+  replication = integer(),
+  lambda_hat = numeric(),
+  test_loss = numeric(),
+  test_set_size_mean = numeric(),
+  n_cal = integer(),
+  theoretical_bound = numeric()
+)
+
+cat("Running", N_REPLICATIONS, "simulations...\n")
+pb <- txtProgressBar(min = 0, max = N_REPLICATIONS, style = 3)
+
+for (rep in 1:N_REPLICATIONS) {
+  
+  # Data splitting
+  n <- nrow(df)
+  train_idx <- sample(1:n, size = floor(TRAIN_PROP * n))
+  remaining_idx <- setdiff(1:n, train_idx)
+  cal_idx <- sample(remaining_idx, size = floor(CAL_PROP * n))
+  test_idx <- setdiff(remaining_idx, cal_idx)
+  
+  train_data <- df[train_idx, ]
+  cal_data <- df[cal_idx, ]
+  test_data <- df[test_idx, ]
+  n_cal <- nrow(cal_data)
+  
+  # Pretraining
+  rf_model <- randomForest(diabetes ~ ., 
+                           data = train_data,
+                           ntree = 200,
+                           mtry = 3,
+                           verbose = FALSE)
+  
+  cal_probs <- predict(rf_model, newdata = cal_data, type = "prob")
+  test_probs <- predict(rf_model, newdata = test_data, type = "prob")
+  
+  # Calibration - compute loss matrix
+  n_cal_samples <- nrow(cal_data)
+  L_matrix <- matrix(NA, nrow = n_cal_samples, ncol = m)
+  
+  for (j in 1:m) {
+    lambda <- lambda_grid[j]
+    for (i in 1:n_cal_samples) {
+      L_matrix[i, j] <- compute_fdr_loss(
+        cal_probs[i, ], 
+        as.character(cal_data$diabetes[i]), 
+        lambda, 
+        class_names
+      )
+    }
+  }
+  
+  # Select lambda
+  R_hat <- colMeans(L_matrix)
+  adjusted_risk <- (n_cal / (n_cal + 1)) * R_hat + B / (n_cal + 1)
+  feasible <- which(adjusted_risk <= alpha)
+  
+  if (length(feasible) == 0) {
+    lambda_hat_idx <- which.min(adjusted_risk)
+  } else {
+    lambda_hat_idx <- min(feasible)
+  }
+  
+  lambda_hat <- lambda_grid[lambda_hat_idx]
+  
+  # Test evaluation
+  n_test <- nrow(test_data)
+  test_losses <- numeric(n_test)
+  test_set_sizes <- numeric(n_test)
+  
+  for (i in 1:n_test) {
+    test_losses[i] <- compute_fdr_loss(
+      test_probs[i, ], 
+      as.character(test_data$diabetes[i]), 
+      lambda_hat, 
+      class_names
+    )
+    
+    threshold <- 1 - lambda_hat
+    test_set_sizes[i] <- sum(test_probs[i, ] >= threshold)
+  }
+  
+  test_fdr <- mean(test_losses)
+  test_set_size_mean <- mean(test_set_sizes)
+  theoretical_bound <- alpha + B * sqrt(log(2 * m) / (2 * n_cal))
+  
+  # Store results
+  results <- rbind(results, data.frame(
+    replication = rep,
+    lambda_hat = lambda_hat,
+    test_loss = test_fdr,
+    test_set_size_mean = test_set_size_mean,
+    n_cal = n_cal,
+    theoretical_bound = theoretical_bound
+  ))
+  
+  setTxtProgressBar(pb, rep)
+}
+close(pb)
+
+# ===========================
+# RESULTS SUMMARY
+# ===========================
+mean_test_loss <- mean(results$test_loss)
+sd_test_loss <- sd(results$test_loss)
+se_test_loss <- sd_test_loss / sqrt(N_REPLICATIONS)
+mean_theoretical_bound <- mean(results$theoretical_bound)
+
+cat("\n\n=== RESULTS ===\n")
+cat("Empirical E[L_{n+1}(λ̂)]:", round(mean_test_loss, 4), 
+    "±", round(1.96*se_test_loss, 4), "(95% CI)\n")
+cat("Theoretical bound:", round(mean_theoretical_bound, 4), "\n")
+cat("Target α:", alpha, "\n")
+cat("Gap:", round(mean_test_loss - mean_theoretical_bound, 4), "\n")
+
+if (mean_test_loss <= mean_theoretical_bound) {
+  cat("✓ SUCCESS: Empirical loss ≤ Theoretical bound\n")
+} else {
+  cat("⚠ Empirical loss exceeds bound\n")
+}
+
+cat("\nPr(L_{n+1}(λ̂) ≤ bound):", round(mean(results$test_loss <= results$theoretical_bound), 3), "\n")
+cat("Pr(L_{n+1}(λ̂) ≤ α):", round(mean(results$test_loss <= alpha), 3), "\n")
+
+cat("\nMean prediction set size:", round(mean(results$test_set_size_mean), 3), "\n")
+cat("Mean λ̂:", round(mean(results$lambda_hat), 3), "\n\n")
+
+# ===========================
+# KEY VISUALIZATIONS
+# ===========================
+
+# Plot 1: Distribution of test loss
+p1 <- ggplot(results, aes(x = test_loss)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = mean_test_loss, color = "red", 
+             linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = alpha, color = "darkgreen", 
+             linetype = "dotted", linewidth = 1.2) +
+  geom_vline(xintercept = mean_theoretical_bound, color = "orange", 
+             linetype = "dashed", linewidth = 1.2) +
+  annotate("text", x = mean_test_loss, y = Inf, 
+           label = paste("Mean =", round(mean_test_loss, 3)),
+           vjust = 2, hjust = 1.1, color = "red", size = 4) +
+  annotate("text", x = alpha, y = Inf, 
+           label = paste("α =", alpha),
+           vjust = 4, hjust = 1.1, color = "darkgreen", size = 4) +
+  annotate("text", x = mean_theoretical_bound, y = Inf, 
+           label = paste("Bound =", round(mean_theoretical_bound, 3)),
+           vjust = 6, hjust = 1.1, color = "orange", size = 4) +
+  labs(title = "Distribution of Test Loss L_{n+1}(λ̂)",
+       subtitle = paste0(N_REPLICATIONS, " replications"),
+       x = "Test FDR Loss", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p1)
+
+# Plot 2: Distribution of prediction set sizes
+p2 <- ggplot(results, aes(x = test_set_size_mean)) +
+  geom_histogram(bins = 30, fill = "mediumpurple", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = mean(results$test_set_size_mean), 
+             color = "red", linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = 1, color = "blue", linetype = "dotted", linewidth = 1) +
+  geom_vline(xintercept = 2, color = "blue", linetype = "dotted", linewidth = 1) +
+  annotate("text", x = mean(results$test_set_size_mean), y = Inf,
+           label = paste("Mean =", round(mean(results$test_set_size_mean), 2)),
+           vjust = 2, hjust = -0.1, color = "red", size = 4) +
+  labs(title = "Distribution of Prediction Set Sizes",
+       subtitle = "Smaller sets = more efficient",
+       x = "Average |C_λ̂(X)|", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p2)
+
+# Plot 3: Bound vs empirical risk
+comparison_df <- data.frame(
+  Type = c(rep("Test Loss", N_REPLICATIONS), 
+           rep("Theoretical Bound", N_REPLICATIONS),
+           rep("Target α", N_REPLICATIONS)),
+  Value = c(results$test_loss, 
+            results$theoretical_bound, 
+            rep(alpha, N_REPLICATIONS))
+)
+
+p3 <- ggplot(comparison_df, aes(x = Type, y = Value, fill = Type)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, fill = "red") +
+  labs(title = "Risk Control Performance",
+       subtitle = "Red diamond = mean",
+       y = "Risk Level",
+       x = "") +
+  scale_fill_manual(values = c("Test Loss" = "steelblue", 
+                               "Theoretical Bound" = "orange",
+                               "Target α" = "darkgreen")) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        legend.position = "none")
+
+print(p3)
+
+# Plot 4: Set size vs loss (efficiency trade-off)
+p4 <- ggplot(results, aes(x = test_set_size_mean, y = test_loss)) +
+  geom_point(alpha = 0.4, color = "darkblue", size = 2) +
+  geom_smooth(method = "loess", color = "red", se = TRUE, linewidth = 1) +
+  geom_hline(yintercept = alpha, color = "darkgreen", linetype = "dashed") +
+  labs(title = "Efficiency vs Risk Trade-off",
+       subtitle = "Smaller sets = more informative but potentially higher risk",
+       x = "Average Prediction Set Size |C_λ̂|",
+       y = "Test Loss (FDR)") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p4)
+
+
+##################################
+
+# Conformal Risk Control - Clean Implementation
+# Repeated simulations to estimate E[L_{n+1}(λ̂)]
+
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(randomForest, ggplot2, dplyr, mlbench, tidyr)
+
+set.seed(123)
+
+# ===========================
+# PARAMETERS
+# ===========================
+N_REPLICATIONS <- 500
+TRAIN_PROP <- 0.6
+CAL_PROP <- 0.3
+TEST_PROP <- 0.1
+
+lambda_grid <- seq(0, 1, length.out = 50)
+m <- length(lambda_grid)
+alpha <- 0.2
+B <- 1.0
+
+# ===========================
+# FDR LOSS FUNCTION
+# ===========================
+# L_i^{FDR}(λ) = 1 - |Y_i ∩ C_λ(X_i)| / |C_λ(X_i)|
+# where C_λ(X_i) = {y : P(y|X_i) ≥ 1-λ}
+
+compute_fdr_loss <- function(probs_row, true_label, lambda, class_names) {
+  threshold <- 1 - lambda
+  pred_set <- class_names[probs_row >= threshold]
+  set_size <- length(pred_set)
+  coverage <- as.numeric(true_label %in% pred_set)
+  
+  if (set_size == 0) {
+    return(1.0)
+  } else {
+    return(1 - coverage / set_size)
+  }
+}
+
+# ===========================
+# LOAD DATA
+# ===========================
+# Options: "pima", "breast_cancer", "ionosphere"
+DATASET <- "breast_cancer"
+
+if (DATASET == "pima") {
+  data(PimaIndiansDiabetes)
+  df <- PimaIndiansDiabetes
+  class_names <- c("neg", "pos")
+  cat("Dataset: Pima Indians Diabetes\n")
+} else if (DATASET == "breast_cancer") {
+  data(BreastCancer)
+  df <- BreastCancer
+  # Remove ID column and handle missing values
+  df <- df[, -1]  # Remove Id
+  df <- na.omit(df)  # Remove rows with missing values
+  class_names <- c("benign", "malignant")
+  cat("Dataset: Breast Cancer Wisconsin\n")
+} else if (DATASET == "ionosphere") {
+  data(Ionosphere)
+  df <- Ionosphere
+  class_names <- c("bad", "good")
+  cat("Dataset: Ionosphere\n")
+}
+
+cat("Samples:", nrow(df), "| Features:", ncol(df)-1, "\n")
+cat("Class distribution:", table(df[, ncol(df)]), "\n\n")
+
+# ===========================
+# SIMULATION LOOP
+# ===========================
+results <- data.frame(
+  replication = integer(),
+  lambda_hat = numeric(),
+  test_loss = numeric(),
+  test_set_size_mean = numeric(),
+  n_cal = integer(),
+  theoretical_bound = numeric()
+)
+
+cat("Running", N_REPLICATIONS, "simulations...\n")
+pb <- txtProgressBar(min = 0, max = N_REPLICATIONS, style = 3)
+
+for (rep in 1:N_REPLICATIONS) {
+  
+  # Data splitting
+  n <- nrow(df)
+  train_idx <- sample(1:n, size = floor(TRAIN_PROP * n))
+  remaining_idx <- setdiff(1:n, train_idx)
+  cal_idx <- sample(remaining_idx, size = floor(CAL_PROP * n))
+  test_idx <- setdiff(remaining_idx, cal_idx)
+  
+  train_data <- df[train_idx, ]
+  cal_data <- df[cal_idx, ]
+  test_data <- df[test_idx, ]
+  n_cal <- nrow(cal_data)
+  
+  # Pretraining
+  target_col <- ncol(train_data)
+  formula <- as.formula(paste(names(train_data)[target_col], "~ ."))
+  rf_model <- randomForest(formula, 
+                           data = train_data,
+                           ntree = 200,
+                           mtry = 3,
+                           verbose = FALSE)
+  
+  cal_probs <- predict(rf_model, newdata = cal_data, type = "prob")
+  test_probs <- predict(rf_model, newdata = test_data, type = "prob")
+  
+  # Calibration - compute loss matrix
+  n_cal_samples <- nrow(cal_data)
+  L_matrix <- matrix(NA, nrow = n_cal_samples, ncol = m)
+  
+  for (j in 1:m) {
+    lambda <- lambda_grid[j]
+    for (i in 1:n_cal_samples) {
+      L_matrix[i, j] <- compute_fdr_loss(
+        cal_probs[i, ], 
+        as.character(cal_data[i, target_col]), 
+        lambda, 
+        class_names
+      )
+    }
+  }
+  
+  # Select lambda
+  R_hat <- colMeans(L_matrix)
+  adjusted_risk <- (n_cal / (n_cal + 1)) * R_hat + B / (n_cal + 1)
+  feasible <- which(adjusted_risk <= alpha)
+  
+  if (length(feasible) == 0) {
+    lambda_hat_idx <- which.min(adjusted_risk)
+  } else {
+    lambda_hat_idx <- min(feasible)
+  }
+  
+  lambda_hat <- lambda_grid[lambda_hat_idx]
+  
+  # Test evaluation
+  n_test <- nrow(test_data)
+  test_losses <- numeric(n_test)
+  test_set_sizes <- numeric(n_test)
+  
+  for (i in 1:n_test) {
+    test_losses[i] <- compute_fdr_loss(
+      test_probs[i, ], 
+      as.character(test_data[i, target_col]), 
+      lambda_hat, 
+      class_names
+    )
+    
+    threshold <- 1 - lambda_hat
+    test_set_sizes[i] <- sum(test_probs[i, ] >= threshold)
+  }
+  
+  test_fdr <- mean(test_losses)
+  test_set_size_mean <- mean(test_set_sizes)
+  theoretical_bound <- alpha + B * sqrt(log(2 * m) / (2 * n_cal))
+  
+  # Store results
+  results <- rbind(results, data.frame(
+    replication = rep,
+    lambda_hat = lambda_hat,
+    test_loss = test_fdr,
+    test_set_size_mean = test_set_size_mean,
+    n_cal = n_cal,
+    theoretical_bound = theoretical_bound
+  ))
+  
+  setTxtProgressBar(pb, rep)
+}
+close(pb)
+
+# ===========================
+# RESULTS SUMMARY
+# ===========================
+mean_test_loss <- mean(results$test_loss)
+sd_test_loss <- sd(results$test_loss)
+se_test_loss <- sd_test_loss / sqrt(N_REPLICATIONS)
+mean_theoretical_bound <- mean(results$theoretical_bound)
+
+cat("\n\n=== RESULTS ===\n")
+cat("Empirical E[L_{n+1}(λ̂)]:", round(mean_test_loss, 4), 
+    "±", round(1.96*se_test_loss, 4), "(95% CI)\n")
+cat("Theoretical bound:", round(mean_theoretical_bound, 4), "\n")
+cat("Target α:", alpha, "\n")
+cat("Gap:", round(mean_test_loss - mean_theoretical_bound, 4), "\n")
+
+if (mean_test_loss <= mean_theoretical_bound) {
+  cat("✓ SUCCESS: Empirical loss ≤ Theoretical bound\n")
+} else {
+  cat("⚠ Empirical loss exceeds bound\n")
+}
+
+cat("\nPr(L_{n+1}(λ̂) ≤ bound):", round(mean(results$test_loss <= results$theoretical_bound), 3), "\n")
+cat("Pr(L_{n+1}(λ̂) ≤ α):", round(mean(results$test_loss <= alpha), 3), "\n")
+
+cat("\nMean prediction set size:", round(mean(results$test_set_size_mean), 3), "\n")
+cat("Mean λ̂:", round(mean(results$lambda_hat), 3), "\n\n")
+
+# ===========================
+# KEY VISUALIZATIONS
+# ===========================
+
+# Plot 1: Distribution of test loss
+p1 <- ggplot(results, aes(x = test_loss)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = mean_test_loss, color = "red", 
+             linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = alpha, color = "darkgreen", 
+             linetype = "dotted", linewidth = 1.2) +
+  geom_vline(xintercept = mean_theoretical_bound, color = "orange", 
+             linetype = "dashed", linewidth = 1.2) +
+  annotate("text", x = mean_test_loss, y = Inf, 
+           label = paste("Mean =", round(mean_test_loss, 3)),
+           vjust = 2, hjust = 1.1, color = "red", size = 4) +
+  annotate("text", x = alpha, y = Inf, 
+           label = paste("α =", alpha),
+           vjust = 4, hjust = 1.1, color = "darkgreen", size = 4) +
+  annotate("text", x = mean_theoretical_bound, y = Inf, 
+           label = paste("Bound =", round(mean_theoretical_bound, 3)),
+           vjust = 6, hjust = 1.1, color = "orange", size = 4) +
+  labs(title = "Distribution of Test Loss L_{n+1}(λ̂)",
+       subtitle = paste0(N_REPLICATIONS, " replications"),
+       x = "Test FDR Loss", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p1)
+
+# Plot 2: Distribution of prediction set sizes
+p2 <- ggplot(results, aes(x = test_set_size_mean)) +
+  geom_histogram(bins = 30, fill = "mediumpurple", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = mean(results$test_set_size_mean), 
+             color = "red", linetype = "dashed", linewidth = 1.2) +
+  geom_vline(xintercept = 1, color = "blue", linetype = "dotted", linewidth = 1) +
+  geom_vline(xintercept = 2, color = "blue", linetype = "dotted", linewidth = 1) +
+  annotate("text", x = mean(results$test_set_size_mean), y = Inf,
+           label = paste("Mean =", round(mean(results$test_set_size_mean), 2)),
+           vjust = 2, hjust = -0.1, color = "red", size = 4) +
+  labs(title = "Distribution of Prediction Set Sizes",
+       subtitle = "Smaller sets = more efficient",
+       x = "Average |C_λ̂(X)|", 
+       y = "Frequency") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p2)
+
+# Plot 3: Bound vs empirical risk
+comparison_df <- data.frame(
+  Type = c(rep("Test Loss", N_REPLICATIONS), 
+           rep("Theoretical Bound", N_REPLICATIONS),
+           rep("Target α", N_REPLICATIONS)),
+  Value = c(results$test_loss, 
+            results$theoretical_bound, 
+            rep(alpha, N_REPLICATIONS))
+)
+
+p3 <- ggplot(comparison_df, aes(x = Type, y = Value, fill = Type)) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.3) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4, fill = "red") +
+  labs(title = "Risk Control Performance",
+       subtitle = "Red diamond = mean",
+       y = "Risk Level",
+       x = "") +
+  scale_fill_manual(values = c("Test Loss" = "steelblue", 
+                               "Theoretical Bound" = "orange",
+                               "Target α" = "darkgreen")) +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        legend.position = "none")
+
+print(p3)
+
+# Plot 4: Set size vs loss (efficiency trade-off)
+p4 <- ggplot(results, aes(x = test_set_size_mean, y = test_loss)) +
+  geom_point(alpha = 0.4, color = "darkblue", size = 2) +
+  geom_smooth(method = "loess", color = "red", se = TRUE, linewidth = 1) +
+  geom_hline(yintercept = alpha, color = "darkgreen", linetype = "dashed") +
+  labs(title = "Efficiency vs Risk Trade-off",
+       subtitle = "Smaller sets = more informative but potentially higher risk",
+       x = "Average Prediction Set Size |C_λ̂|",
+       y = "Test Loss (FDR)") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+print(p4)
