@@ -1,0 +1,227 @@
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+
+# Parameters
+n_seq <- seq(500, 1000, by = 50)
+delta <- 0.5
+alpha <- 0.05
+num_labels <- 5
+N <- 50  # Number of trials for averaging
+
+# Helper functions
+h1 <- function(a, b) {
+  if (a == 0 || a == 1) return(0)
+  a * log(a / b) + (1 - a) * log((1 - a) / (1 - b))
+}
+
+simulate_multilabel_data <- function(n_samples, n_labels = 5) {
+  X <- matrix(rnorm(n_samples * 10), ncol = 10)
+  W <- matrix(rnorm(10 * n_labels), ncol = n_labels)
+  probs <- 1 / (1 + exp(-X %*% W))
+  Y <- matrix(rbinom(n_samples * n_labels, 1, as.vector(probs)), ncol = n_labels)
+  list(X = X, Y = Y)
+}
+
+fit_predictor <- function(X_train, Y_train) {
+  models <- lapply(1:ncol(Y_train), function(j) {
+    glm(Y_train[, j] ~ ., data = data.frame(X_train), family = binomial)
+  })
+  function(X_new) {
+    sapply(models, function(model) predict(model, newdata = data.frame(X_new), type = "response"))
+  }
+}
+
+# NEW FDR LOSS FUNCTION
+fdr_loss <- function(y_true, y_pred_set) {
+  pred_set_size <- sum(y_pred_set == 1)
+  # If prediction set is empty, FDR is undefined but we treat as 0 loss
+  if (pred_set_size == 0) return(0)
+  intersection_size <- sum((y_true == 1) & (y_pred_set == 1))
+  1 - (intersection_size / pred_set_size)
+}
+
+# Initialize results storage
+results_df <- data.frame()
+
+set.seed(123)
+
+# ----- Loop over n values -----
+for (n in n_seq) {
+  m <- 10
+  lambda_seq <- seq(0.1, 0.9, length.out = m)
+  
+  ltt_losses <- numeric(N)
+  crc_losses <- numeric(N)
+  rcps_losses <- numeric(N)
+  
+  for (trial in 1:N) {
+    # Simulate data
+    total_needed <- 2 * n + 100  # Extra test samples
+    data <- simulate_multilabel_data(total_needed, num_labels)
+    X <- data$X
+    Y <- data$Y
+    
+    # Split data
+    X_train <- X[1:n, ]
+    Y_train <- Y[1:n, ]
+    X_cal <- X[(n + 1):(2 * n), ]
+    Y_cal <- Y[(n + 1):(2 * n), ]
+    X_test <- X[(2 * n + 1):total_needed, ]
+    Y_test <- Y[(2 * n + 1):total_needed, ]
+    
+    # Train predictor
+    predictor <- fit_predictor(X_train, Y_train)
+    preds_cal <- predictor(X_cal)
+    preds_test <- predictor(X_test)
+    
+    # ----- LTT Method -----
+    empirical_risks <- numeric(m)
+    for (j in 1:m) {
+      threshold <- 1 - lambda_seq[j]
+      pred_set <- (preds_cal >= threshold) * 1
+      
+      losses <- apply(cbind(Y_cal, pred_set), 1, function(row) {
+        y_true <- row[1:num_labels]
+        y_pred <- row[(num_labels+1):(2*num_labels)]
+        fdr_loss(y_true, y_pred)
+      })
+      empirical_risks[j] <- mean(losses)
+    }
+    
+    p_values <- numeric(m)
+    for (j in 1:m) {
+      Rj <- empirical_risks[j]
+      Rj_cap <- min(Rj, alpha)
+      term1 <- exp(-n * h1(Rj_cap, alpha))
+      term2 <- exp(1) * pbinom(ceiling(n * Rj), n, alpha)
+      p_values[j] <- min(term1, term2)
+    }
+    
+    threshold_ltt <- delta / m
+    valid_indices <- which(p_values <= threshold_ltt)
+    lambda_ltt <- if (length(valid_indices) > 0) min(lambda_seq[valid_indices]) else 1
+    
+    # Test LTT
+    threshold <- 1 - lambda_ltt
+    pred_set_test <- ifelse(preds_test >= threshold, 1, 0)
+    test_losses <- apply(cbind(Y_test, pred_set_test), 1, function(row) {
+      y_true <- row[1:num_labels]
+      y_pred <- row[(num_labels+1):(2*num_labels)]
+      fdr_loss(y_true, y_pred)
+    })
+    ltt_losses[trial] <- mean(test_losses)
+    
+    # ----- CRC Method -----
+    valid_lambdas <- c()
+    for (j in seq_along(lambda_seq)) {
+      lambda_j <- lambda_seq[j]
+      threshold <- 1 - lambda_j
+      pred_sets_cal <- ifelse(preds_cal >= threshold, 1, 0)
+      
+      losses <- apply(cbind(Y_cal, pred_sets_cal), 1, function(row) {
+        y_true <- row[1:num_labels]
+        y_pred <- row[(num_labels+1):(2*num_labels)]
+        fdr_loss(y_true, y_pred)
+      })
+      
+      Rn <- mean(losses)
+      lhs <- n / (n + 1) * Rn + 1 / (n + 1)
+      
+      if (lhs <= alpha) {
+        valid_lambdas <- c(valid_lambdas, lambda_j)
+      }
+    }
+    lambda_crc <- if (length(valid_lambdas) == 0) 1 else min(valid_lambdas)
+    
+    # Test CRC
+    threshold <- 1 - lambda_crc
+    pred_set_test <- ifelse(preds_test >= threshold, 1, 0)
+    test_losses <- apply(cbind(Y_test, pred_set_test), 1, function(row) {
+      y_true <- row[1:num_labels]
+      y_pred <- row[(num_labels+1):(2*num_labels)]
+      fdr_loss(y_true, y_pred)
+    })
+    crc_losses[trial] <- mean(test_losses)
+    
+    # ----- RCPS Method -----
+    valid_lambdas <- c()
+    for (j in seq_along(lambda_seq)) {
+      lambda_j <- lambda_seq[j]
+      threshold <- 1 - lambda_j
+      pred_sets_cal <- ifelse(preds_cal >= threshold, 1, 0)
+      
+      losses <- apply(cbind(Y_cal, pred_sets_cal), 1, function(row) {
+        y_true <- row[1:num_labels]
+        y_pred <- row[(num_labels+1):(2*num_labels)]
+        fdr_loss(y_true, y_pred)
+      })
+      
+      Rn <- mean(losses)
+      lhs <- Rn + sqrt(1/(2*n) * log(1/delta))
+      
+      if (lhs <= alpha) {
+        valid_lambdas <- c(valid_lambdas, lambda_j)
+      }
+    }
+    lambda_rcps <- if (length(valid_lambdas) == 0) 1 else min(valid_lambdas)
+    
+    # Test RCPS
+    threshold <- 1 - lambda_rcps
+    pred_set_test <- ifelse(preds_test >= threshold, 1, 0)
+    test_losses <- apply(cbind(Y_test, pred_set_test), 1, function(row) {
+      y_true <- row[1:num_labels]
+      y_pred <- row[(num_labels+1):(2*num_labels)]
+      fdr_loss(y_true, y_pred)
+    })
+    rcps_losses[trial] <- mean(test_losses)
+  }
+  
+  # Store average results
+  results_df <- rbind(results_df, 
+                      data.frame(n = n, FDR = mean(ltt_losses), method = "LTT"),
+                      data.frame(n = n, FDR = mean(crc_losses), method = "CRC"),
+                      data.frame(n = n, FDR = mean(rcps_losses), method = "RCPS"))
+  
+  cat(sprintf("Completed n=%d\n", n))
+}
+
+# ----- Plot Results -----
+# Create theoretical bound data
+B <- 1  # Adjust this constant as needed
+m_vals <- floor(sqrt(n_seq))
+bound_vals <- alpha + B * sqrt(log(2 * m_vals) / (2 * n_seq))
+bound_df <- data.frame(n = n_seq, bound = bound_vals)
+
+p <- ggplot(results_df, aes(x = n, y = FDR, color = method, linetype = method)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2.5) +
+  geom_line(data = bound_df, aes(x = n, y = bound), 
+            color = "black", linetype = "dashed", size = 1, inherit.aes = FALSE) +
+  annotate("text", x = max(n_seq) * 0.7, y = max(bound_vals) * 1.1, 
+           label = "Theoretical Bound", size = 4, color = "black") +
+  labs(title = "Risk Control Methods Comparison: FDR Loss vs Calibration Size",
+       x = "Calibration Sample Size (n)",
+       y = "False Discovery Rate (FDR) Loss",
+       color = "Method",
+       linetype = "Method") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()) +
+  scale_color_manual(values = c("LTT" = "#E41A1C", "CRC" = "#377EB8", "RCPS" = "#4DAF4A")) +
+  ylim(0, max(c(results_df$FDR, bound_vals * 1.2)))
+
+print(p)
+
+# Print summary statistics
+cat("\n=== Summary Statistics ===\n")
+summary_stats <- results_df %>%
+  group_by(method) %>%
+  summarise(
+    mean_FDR = mean(FDR),
+    max_FDR = max(FDR),
+    violations = sum(FDR > alpha),
+    pct_violations = 100 * sum(FDR > alpha) / n()
+  )
+print(summary_stats)
