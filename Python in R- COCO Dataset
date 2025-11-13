@@ -1,0 +1,273 @@
+# Install reticulate if you haven't already
+if (!require("reticulate")) {
+  install.packages("reticulate")
+}
+
+# Load the package
+library(reticulate)
+
+# Check your Python configuration
+py_config()
+
+# Optional: Check available Python versions on your system
+py_discover_config()
+
+# Set up your directory structure
+coco_root <- "C:/coco_dataset"  # Change this to your preferred location
+
+# Create directory structure
+dir.create(coco_root, showWarnings = FALSE)
+dir.create(file.path(coco_root, "annotations"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(coco_root, "images", "val2017"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(coco_root, "images", "train2017"), showWarnings = FALSE, recursive = TRUE)
+
+# Print the structure
+cat("COCO directory structure created at:", coco_root, "\n")
+list.dirs(coco_root, recursive = TRUE)
+
+# Download validation annotations (smaller file ~240MB)
+val_ann_url <- "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+
+# Download validation images (~1GB for 5000 images)
+val_img_url <- "http://images.cocodataset.org/zips/val2017.zip"
+
+# Function to download with progress
+download_coco <- function(url, dest_dir) {
+  filename <- basename(url)
+  dest_file <- file.path(dest_dir, filename)
+  
+  if (!file.exists(dest_file)) {
+    cat("Downloading:", filename, "\n")
+    cat("This may take a while depending on your internet speed...\n")
+    download.file(url, dest_file, mode = "wb")
+    cat("Download complete:", filename, "\n")
+  } else {
+    cat("File already exists:", filename, "\n")
+  }
+  return(dest_file)
+}
+
+# Start with just annotations to test (smaller download)
+ann_file <- download_coco(val_ann_url, coco_root)
+
+# First, let's extract the annotations
+ann_zip <- file.path(coco_root, "annotations_trainval2017.zip")
+
+# Extract the annotations
+cat("Extracting annotations...\n")
+unzip(ann_zip, exdir = coco_root)
+cat("Extraction complete!\n")
+
+# Check what annotation files we have
+ann_files <- list.files(file.path(coco_root, "annotations"), pattern = "*.json")
+cat("\nAvailable annotation files:\n")
+print(ann_files)
+
+# Now let's download the validation images (1GB - much smaller than train)
+val_img_url <- "http://images.cocodataset.org/zips/val2017.zip"
+
+cat("\nNow downloading validation images (5000 images, ~1GB)...\n")
+cat("This will take a few minutes depending on your internet speed.\n")
+
+val_img_file <- download_coco(val_img_url, coco_root)
+
+# Once downloaded, extract the images
+cat("\nExtracting validation images...\n")
+unzip(val_img_file, exdir = file.path(coco_root, "images"))
+cat("Extraction complete!\n")
+
+# Verify the structure
+cat("\nChecking COCO dataset structure:\n")
+cat("Annotations:", length(ann_files), "JSON files found\n")
+val_images <- list.files(file.path(coco_root, "images", "val2017"), pattern = "*.jpg")
+cat("Validation images:", length(val_images), "images found\n")
+
+# Import the COCO API
+coco <- import("pycocotools.coco")
+
+# Path to the validation annotation file
+ann_file <- file.path(coco_root, "annotations", "instances_val2017.json")
+
+# Check the file exists
+cat("Annotation file exists:", file.exists(ann_file), "\n")
+cat("File path:", ann_file, "\n\n")
+
+# Initialize COCO API for instance annotations
+cat("Loading COCO annotations... (this may take a moment)\n")
+coco_obj <- coco$COCO(ann_file)
+cat("COCO annotations loaded successfully!\n\n")
+
+# Get basic information about the dataset
+cat("Dataset Information:\n")
+cat("===================\n")
+
+# Get all category IDs and info
+cat_ids <- coco_obj$getCatIds()
+categories <- coco_obj$loadCats(cat_ids)
+cat("Number of categories:", length(categories), "\n")
+
+# Get all image IDs
+img_ids <- coco_obj$getImgIds()
+cat("Number of images:", length(img_ids), "\n")
+
+# Get all annotation IDs
+ann_ids <- coco_obj$getAnnIds()
+cat("Number of annotations:", length(ann_ids), "\n\n")
+
+# Display first 10 categories as an example
+cat("First 10 categories:\n")
+for(i in 1:10) {
+  cat(sprintf("  %d. %s (id: %d)\n", 
+              i, 
+              categories[[i]]$name, 
+              categories[[i]]$id))
+}
+
+# Store the coco object for use
+cat("\nCOCO object 'coco_obj' is ready to use for queries!\n")
+
+
+# Step 6 - Modified version to handle large integers:
+
+# Pass coco_obj to Python
+py$coco_obj <- coco_obj
+
+# Create Python helper functions that convert large ints to strings
+py_run_string("
+def get_image_data(coco_obj, img_id):
+    img = coco_obj.loadImgs(int(img_id))[0]
+    return {
+        'image_id': str(img_id),  # Convert to string to avoid overflow
+        'file_name': str(img['file_name']),
+        'width': int(img['width']),
+        'height': int(img['height'])
+    }
+
+def get_annotation_data(coco_obj, img_id):
+    ann_ids = coco_obj.getAnnIds(imgIds=int(img_id))
+    anns = coco_obj.loadAnns(ann_ids)
+    result = []
+    for ann in anns:
+        result.append({
+            'image_id': str(img_id),  # Convert to string
+            'ann_id': str(ann['id']),  # Convert to string
+            'cat_id': int(ann['category_id']),  # Category IDs are small, keep as int
+            'bbox_x': float(ann['bbox'][0]),
+            'bbox_y': float(ann['bbox'][1]),
+            'bbox_w': float(ann['bbox'][2]),
+            'bbox_h': float(ann['bbox'][3]),
+            'area': float(ann['area'])
+        })
+    return result
+")
+
+# Now extract data for first 100 images
+n_images <- 100
+images_list <- list()
+annotations_list <- list()
+
+cat("Extracting data from COCO...\n")
+for(i in 1:n_images) {
+  if(i %% 20 == 0) cat("Processing image", i, "of", n_images, "\n")
+  
+  img_id <- img_ids[i]
+  
+  # Get image data
+  img_data <- py_eval(sprintf("get_image_data(coco_obj, %s)", img_id))
+  images_list[[i]] <- img_data
+  
+  # Get annotations
+  ann_data <- py_eval(sprintf("get_annotation_data(coco_obj, %s)", img_id))
+  if(length(ann_data) > 0) {
+    annotations_list <- c(annotations_list, ann_data)
+  }
+}
+
+# Convert to R data frames
+cat("Converting to data frames...\n")
+images_df <- do.call(rbind, lapply(images_list, as.data.frame))
+
+# Add file paths
+images_df$file_path <- file.path(coco_root, "images", "val2017", images_df$file_name)
+
+if(length(annotations_list) > 0) {
+  annotations_df <- do.call(rbind, lapply(annotations_list, as.data.frame))
+}
+
+# Store in list
+coco_data <- list(
+  images = images_df,
+  annotations = annotations_df
+)
+
+cat("Success! Extracted", nrow(images_df), "images and", nrow(annotations_df), "annotations\n")
+
+# Show sample
+print(head(images_df, 3))
+print(head(annotations_df, 5))
+
+
+# Step 7: Setup pre-trained object detection model
+
+# Install torch for R if not already installed
+if (!require("torch")) {
+  install.packages("torch")
+  library(torch)
+  torch::install_torch()
+}
+
+# Install torchvision for pre-trained models
+if (!require("torchvision")) {
+  install.packages("torchvision")
+}
+
+library(torch)
+library(torchvision)
+
+# Load a pre-trained Faster R-CNN model (trained on COCO)
+cat("Loading pre-trained Faster R-CNN model...\n")
+model <- model_fasterrcnn_resnet50_fpn(pretrained = TRUE, progress = TRUE)
+model$eval()  # Set to evaluation mode
+
+# Create a function to preprocess images
+transform <- function(img_path) {
+  img <- torchvision::base_loader(img_path)
+  img <- torchvision::transform_to_tensor(img)
+  return(img)
+}
+
+# Test on one image first
+test_img_path <- coco_data$images$file_path[1]
+cat("Testing on image:", test_img_path, "\n")
+
+# Load and preprocess the image
+img_tensor <- transform(test_img_path)
+img_batch <- torch_unsqueeze(img_tensor, 1)  # Add batch dimension
+
+# Get predictions
+cat("Running inference...\n")
+with_no_grad({
+  predictions <- model(img_batch)
+})
+
+# Check predictions structure
+pred <- predictions[[1]]
+cat("\nPrediction components:\n")
+cat("- Number of detected objects:", length(pred$labels), "\n")
+cat("- Prediction keys:", names(pred), "\n")
+
+# Extract prediction components
+if(length(pred$labels) > 0) {
+  # Convert to R
+  detection_boxes <- as.matrix(pred$boxes$cpu())
+  detection_labels <- as.integer(pred$labels$cpu())
+  detection_scores <- as.numeric(pred$scores$cpu())
+  
+  cat("\nFirst few detections:\n")
+  for(i in 1:min(3, length(detection_labels))) {
+    cat(sprintf("  Object %d: Class %d, Score %.3f\n", 
+                i, detection_labels[i], detection_scores[i]))
+  }
+}
+
+cat("\nModel loaded and tested successfully!\n")
