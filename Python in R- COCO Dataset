@@ -1,143 +1,164 @@
-# Install reticulate if you haven't already
-if (!require("reticulate")) {
+################################################################################
+# Conformal Risk Control (CRC) for Object Detection on COCO Dataset
+# Complete Pipeline - Publication Ready
+#
+# This script implements Conformal Risk Control for controlling the precision
+# of object detection predictions on the COCO validation dataset.
+#
+# Key Parameters:
+#   - Loss Function: Precision loss (1 - precision)
+#   - IoU Threshold: 0.3
+#   - Target Alpha: 0.16
+#   - Dataset Size: 3000 images (1500 calibration, 1500 test)
+#   - Lambda Grid: 21 values from 0 to 1
+#
+# Requirements:
+#   - R packages: reticulate, torch, torchvision, magick
+#   - Python packages: torch, torchvision, pycocotools, PIL
+#   - COCO 2017 validation dataset
+#
+# Runtime: ~2-4 hours (CPU), ~30-60 minutes (GPU)
+#
+# Author: [Your Name]
+# Date: [Date]
+################################################################################
+
+################################################################################
+# BLOCK 0: Python Configuration (CRITICAL - Must run first!)
+################################################################################
+
+cat("Block 0: Configuring Python environment...\n\n")
+
+# Force R to use the correct Python installation where PyTorch is installed
+# IMPORTANT: Change this path if your Python is installed elsewhere
+Sys.setenv(RETICULATE_PYTHON = "C:/Users/telde/AppData/Local/Programs/Python/Python313/python.exe")
+
+cat("✓ Python path configured\n\n")
+
+################################################################################
+# BLOCK 1: Package Installation and Loading
+################################################################################
+
+cat(rep("=", 80), "\n", sep = "")
+cat("CONFORMAL RISK CONTROL FOR OBJECT DETECTION\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+cat("Block 1: Installing and loading required packages...\n\n")
+
+# Install packages if needed
+if (!requireNamespace("reticulate", quietly = TRUE)) {
   install.packages("reticulate")
 }
+if (!requireNamespace("torch", quietly = TRUE)) {
+  install.packages("torch")
+}
+if (!requireNamespace("torchvision", quietly = TRUE)) {
+  install.packages("torchvision")
+}
+if (!requireNamespace("magick", quietly = TRUE)) {
+  install.packages("magick")
+}
 
-# Load the package
+# Load packages
 library(reticulate)
+library(torch)
+library(torchvision)
+library(stats)
+library(magick)
 
-# Check your Python configuration
+cat("✓ Packages loaded successfully\n\n")
+
+################################################################################
+# BLOCK 2: Python Environment Setup
+################################################################################
+
+cat("Block 2: Setting up Python environment...\n\n")
+
+# Configure Python
 py_config()
-
-# Optional: Check available Python versions on your system
 py_discover_config()
 
-# Set up your directory structure
-coco_root <- "C:/coco_dataset"  # Change this to your preferred location
+# Install Python packages
+tryCatch({
+  py_install(c("pycocotools", "Pillow"), pip = TRUE)
+}, error = function(e) {
+  message("Python packages may already be installed: ", e$message)
+})
 
-# Create directory structure
-dir.create(coco_root, showWarnings = FALSE)
+# Import Python modules
+coco_tools <- tryCatch(import("pycocotools.coco"), error = function(e) NULL)
+PIL <- tryCatch(import("PIL"), error = function(e) NULL)
+
+if (is.null(coco_tools) || is.null(PIL)) {
+  stop("pycocotools or Pillow not available. Please install manually.")
+}
+
+cat("✓ Python environment configured\n\n")
+
+################################################################################
+# BLOCK 3: COCO Dataset Download and Loading
+################################################################################
+
+cat("Block 3: Downloading and loading COCO dataset...\n\n")
+
+# Set up directories
+coco_root <- file.path(getwd(), "coco_dataset")
+dir.create(coco_root, showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(coco_root, "annotations"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(coco_root, "images", "val2017"), showWarnings = FALSE, recursive = TRUE)
-dir.create(file.path(coco_root, "images", "train2017"), showWarnings = FALSE, recursive = TRUE)
 
-# Print the structure
-cat("COCO directory structure created at:", coco_root, "\n")
-list.dirs(coco_root, recursive = TRUE)
-
-# Download validation annotations (smaller file ~240MB)
-val_ann_url <- "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-
-# Download validation images (~1GB for 5000 images)
-val_img_url <- "http://images.cocodataset.org/zips/val2017.zip"
-
-# Function to download with progress
-download_coco <- function(url, dest_dir) {
-  filename <- basename(url)
-  dest_file <- file.path(dest_dir, filename)
-  
-  if (!file.exists(dest_file)) {
-    cat("Downloading:", filename, "\n")
-    cat("This may take a while depending on your internet speed...\n")
-    download.file(url, dest_file, mode = "wb")
-    cat("Download complete:", filename, "\n")
-  } else {
-    cat("File already exists:", filename, "\n")
+# Download helper function
+download_if_missing <- function(url, dest_dir) {
+  fname <- basename(url)
+  dest_file <- file.path(dest_dir, fname)
+  if (file.exists(dest_file)) {
+    message("Already present: ", fname)
+    return(dest_file)
   }
-  return(dest_file)
+  message("Downloading ", fname, " ... (this can be large)")
+  utils::download.file(url, dest_file, mode = "wb")
+  message("Downloaded: ", dest_file)
+  dest_file
 }
 
-# Start with just annotations to test (smaller download)
-ann_file <- download_coco(val_ann_url, coco_root)
-
-# First, let's extract the annotations
-ann_zip <- file.path(coco_root, "annotations_trainval2017.zip")
-
-# Extract the annotations
-cat("Extracting annotations...\n")
-unzip(ann_zip, exdir = coco_root)
-cat("Extraction complete!\n")
-
-# Check what annotation files we have
-ann_files <- list.files(file.path(coco_root, "annotations"), pattern = "*.json")
-cat("\nAvailable annotation files:\n")
-print(ann_files)
-
-# Now let's download the validation images (1GB - much smaller than train)
+# Download COCO data
+ann_url <- "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
 val_img_url <- "http://images.cocodataset.org/zips/val2017.zip"
 
-cat("\nNow downloading validation images (5000 images, ~1GB)...\n")
-cat("This will take a few minutes depending on your internet speed.\n")
+ann_zip <- download_if_missing(ann_url, coco_root)
+val_zip <- download_if_missing(val_img_url, coco_root)
 
-val_img_file <- download_coco(val_img_url, coco_root)
+ann_dir <- file.path(coco_root, "annotations")
+val_img_dir <- file.path(coco_root, "images", "val2017")
 
-# Once downloaded, extract the images
-cat("\nExtracting validation images...\n")
-unzip(val_img_file, exdir = file.path(coco_root, "images"))
-cat("Extraction complete!\n")
-
-# Verify the structure
-cat("\nChecking COCO dataset structure:\n")
-cat("Annotations:", length(ann_files), "JSON files found\n")
-val_images <- list.files(file.path(coco_root, "images", "val2017"), pattern = "*.jpg")
-cat("Validation images:", length(val_images), "images found\n")
-
-# Import the COCO API
-coco <- import("pycocotools.coco")
-
-# Path to the validation annotation file
-ann_file <- file.path(coco_root, "annotations", "instances_val2017.json")
-
-# Check the file exists
-cat("Annotation file exists:", file.exists(ann_file), "\n")
-cat("File path:", ann_file, "\n\n")
-
-# Initialize COCO API for instance annotations
-cat("Loading COCO annotations... (this may take a moment)\n")
-coco_obj <- coco$COCO(ann_file)
-cat("COCO annotations loaded successfully!\n\n")
-
-# Get basic information about the dataset
-cat("Dataset Information:\n")
-cat("===================\n")
-
-# Get all category IDs and info
-cat_ids <- coco_obj$getCatIds()
-categories <- coco_obj$loadCats(cat_ids)
-cat("Number of categories:", length(categories), "\n")
-
-# Get all image IDs
-img_ids <- coco_obj$getImgIds()
-cat("Number of images:", length(img_ids), "\n")
-
-# Get all annotation IDs
-ann_ids <- coco_obj$getAnnIds()
-cat("Number of annotations:", length(ann_ids), "\n\n")
-
-# Display first 10 categories as an example
-cat("First 10 categories:\n")
-for(i in 1:10) {
-  cat(sprintf("  %d. %s (id: %d)\n", 
-              i, 
-              categories[[i]]$name, 
-              categories[[i]]$id))
+# Extract if needed
+if (!file.exists(file.path(ann_dir, "instances_val2017.json"))) {
+  message("Extracting annotations...")
+  utils::unzip(ann_zip, exdir = coco_root)
+  message("Annotations extracted.")
+} else {
+  message("Annotations already extracted.")
 }
 
-# Store the coco object for use
-cat("\nCOCO object 'coco_obj' is ready to use for queries!\n")
+if (length(list.files(val_img_dir, pattern = "\\.jpg$", full.names = TRUE)) == 0) {
+  message("Extracting validation images (this may take many minutes)...")
+  utils::unzip(val_zip, exdir = file.path(coco_root, "images"))
+  message("Images extracted.")
+} else {
+  message("Validation images already present.")
+}
 
+# Load COCO annotations via Python
+py_run_string(sprintf("
+import pycocotools.coco as coco_module
+coco_obj = coco_module.COCO('%s')
+", file.path(ann_dir, "instances_val2017.json")))
 
-# Step 6 - Modified version to handle large integers:
-
-# Pass coco_obj to Python
-py$coco_obj <- coco_obj
-
-# Create Python helper functions that convert large ints to strings
 py_run_string("
 def get_image_data(coco_obj, img_id):
     img = coco_obj.loadImgs(int(img_id))[0]
     return {
-        'image_id': str(img_id),  # Convert to string to avoid overflow
+        'image_id': str(img_id),
         'file_name': str(img['file_name']),
         'width': int(img['width']),
         'height': int(img['height'])
@@ -149,9 +170,9 @@ def get_annotation_data(coco_obj, img_id):
     result = []
     for ann in anns:
         result.append({
-            'image_id': str(img_id),  # Convert to string
-            'ann_id': str(ann['id']),  # Convert to string
-            'cat_id': int(ann['category_id']),  # Category IDs are small, keep as int
+            'image_id': str(img_id),
+            'ann_id': str(ann['id']),
+            'cat_id': int(ann['category_id']),
             'bbox_x': float(ann['bbox'][0]),
             'bbox_y': float(ann['bbox'][1]),
             'bbox_w': float(ann['bbox'][2]),
@@ -161,113 +182,1054 @@ def get_annotation_data(coco_obj, img_id):
     return result
 ")
 
-# Now extract data for first 100 images
-n_images <- 100
-images_list <- list()
+# Load metadata for N_pull images
+N_pull <- 3000  # Total images to use (1500 cal + 1500 test)
+img_ids_all <- py$coco_obj$getImgIds()
+N_pull <- min(length(img_ids_all), N_pull)
+
+cat(sprintf("Loading metadata for %d images...\n", N_pull))
+
+images_list <- vector("list", N_pull)
 annotations_list <- list()
 
-cat("Extracting data from COCO...\n")
-for(i in 1:n_images) {
-  if(i %% 20 == 0) cat("Processing image", i, "of", n_images, "\n")
-  
-  img_id <- img_ids[i]
-  
-  # Get image data
-  img_data <- py_eval(sprintf("get_image_data(coco_obj, %s)", img_id))
-  images_list[[i]] <- img_data
-  
-  # Get annotations
-  ann_data <- py_eval(sprintf("get_annotation_data(coco_obj, %s)", img_id))
-  if(length(ann_data) > 0) {
-    annotations_list <- c(annotations_list, ann_data)
+for (i in seq_len(N_pull)) {
+  img_id <- img_ids_all[[i]]
+  images_list[[i]] <- py$get_image_data(py$coco_obj, img_id)
+  ann_tmp <- py$get_annotation_data(py$coco_obj, img_id)
+  if (length(ann_tmp) > 0) {
+    annotations_list <- c(annotations_list, ann_tmp)
+  }
+  if (i %% 200 == 0) {
+    message("Loaded metadata for ", i, " images...")
   }
 }
 
-# Convert to R data frames
-cat("Converting to data frames...\n")
-images_df <- do.call(rbind, lapply(images_list, as.data.frame))
+# Convert to data frames
+images_df <- do.call(rbind, lapply(images_list, function(x) {
+  data.frame(
+    image_id = x$image_id,
+    file_name = x$file_name,
+    width = x$width,
+    height = x$height,
+    stringsAsFactors = FALSE
+  )
+}))
 
-# Add file paths
 images_df$file_path <- file.path(coco_root, "images", "val2017", images_df$file_name)
 
-if(length(annotations_list) > 0) {
-  annotations_df <- do.call(rbind, lapply(annotations_list, as.data.frame))
+annotations_df <- data.frame()
+if (length(annotations_list) > 0) {
+  annotations_df <- do.call(rbind, lapply(annotations_list, function(x) {
+    data.frame(
+      image_id = x$image_id,
+      ann_id = x$ann_id,
+      cat_id = x$cat_id,
+      bbox_x = x$bbox_x,
+      bbox_y = x$bbox_y,
+      bbox_w = x$bbox_w,
+      bbox_h = x$bbox_h,
+      area = x$area,
+      stringsAsFactors = FALSE
+    )
+  }))
 }
 
-# Store in list
-coco_data <- list(
-  images = images_df,
-  annotations = annotations_df
-)
+coco_data <- list(images = images_df, annotations = annotations_df)
 
-cat("Success! Extracted", nrow(images_df), "images and", nrow(annotations_df), "annotations\n")
+# Filter to existing files
+exists_vec <- file.exists(coco_data$images$file_path)
+coco_data$images <- coco_data$images[exists_vec, ]
 
-# Show sample
-print(head(images_df, 3))
-print(head(annotations_df, 5))
+# Filter annotations to match
+valid_image_ids <- coco_data$images$image_id
+coco_data$annotations <- coco_data$annotations[
+  coco_data$annotations$image_id %in% valid_image_ids,
+]
 
+# Build ground truth lookup
+gt_by_image <- split(coco_data$annotations, coco_data$annotations$image_id)
 
-# Step 7: Setup pre-trained object detection model
+cat(sprintf("✓ Loaded %d images with %d annotations\n", 
+            nrow(coco_data$images), nrow(coco_data$annotations)))
+cat(sprintf("✓ %d images have ground truth annotations\n\n", 
+            length(gt_by_image)))
 
-# Install torch for R if not already installed
-if (!require("torch")) {
-  install.packages("torch")
-  library(torch)
-  torch::install_torch()
-}
+################################################################################
+# BLOCK 4: Load Pre-trained Faster R-CNN Model (Python)
+################################################################################
 
-# Install torchvision for pre-trained models
-if (!require("torchvision")) {
-  install.packages("torchvision")
-}
+cat("Block 4: Loading Faster R-CNN model via Python...\n\n")
 
-library(torch)
-library(torchvision)
+# Load model in Python
+py_run_string("
+import torch
+import torchvision
 
-# Load a pre-trained Faster R-CNN model (trained on COCO)
-cat("Loading pre-trained Faster R-CNN model...\n")
-model <- model_fasterrcnn_resnet50_fpn(pretrained = TRUE, progress = TRUE)
-model$eval()  # Set to evaluation mode
+# Load pre-trained Faster R-CNN
+model_py = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+model_py.eval()
+model_py = model_py.cpu()  # Use CPU (change to .cuda() if GPU available)
 
-# Create a function to preprocess images
-transform <- function(img_path) {
-  img <- torchvision::base_loader(img_path)
-  img <- torchvision::transform_to_tensor(img)
-  return(img)
-}
+print('Faster R-CNN model loaded successfully')
+")
 
-# Test on one image first
-test_img_path <- coco_data$images$file_path[1]
-cat("Testing on image:", test_img_path, "\n")
+cat("✓ Faster R-CNN model loaded in Python\n\n")
 
-# Load and preprocess the image
-img_tensor <- transform(test_img_path)
-img_batch <- torch_unsqueeze(img_tensor, 1)  # Add batch dimension
+################################################################################
+# BLOCK 5: Prediction Function
+################################################################################
 
-# Get predictions
-cat("Running inference...\n")
-with_no_grad({
-  predictions <- model(img_batch)
-})
+cat("Block 5: Defining prediction function...\n\n")
 
-# Check predictions structure
-pred <- predictions[[1]]
-cat("\nPrediction components:\n")
-cat("- Number of detected objects:", length(pred$labels), "\n")
-cat("- Prediction keys:", names(pred), "\n")
-
-# Extract prediction components
-if(length(pred$labels) > 0) {
-  # Convert to R
-  detection_boxes <- as.matrix(pred$boxes$cpu())
-  detection_labels <- as.integer(pred$labels$cpu())
-  detection_scores <- as.numeric(pred$scores$cpu())
+predict_one_image <- function(img_path, score_min = 0.0) {
+  # Run Faster R-CNN inference on a single image.
+  #
+  # Args:
+  #   img_path: Path to image file
+  #   score_min: Minimum confidence score threshold
+  #
+  # Returns:
+  #   List with:
+  #     - boxes: N x 4 matrix (x, y, width, height format)
+  #     - scores: N-vector of confidence scores
+  #     - labels: N-vector of class labels
   
-  cat("\nFirst few detections:\n")
-  for(i in 1:min(3, length(detection_labels))) {
-    cat(sprintf("  Object %d: Class %d, Score %.3f\n", 
-                i, detection_labels[i], detection_scores[i]))
+  if (!file.exists(img_path)) {
+    warning("Image not found: ", img_path)
+    return(list(
+      boxes = matrix(numeric(0), 0, 4),
+      scores = numeric(0),
+      labels = integer(0)
+    ))
+  }
+  
+  tryCatch({
+    # Run inference via Python
+    py_run_string(sprintf("
+from PIL import Image
+import torchvision.transforms as T
+
+img = Image.open('%s').convert('RGB')
+transform = T.ToTensor()
+img_tensor = transform(img).unsqueeze(0)
+
+with torch.no_grad():
+    predictions = model_py(img_tensor)
+
+pred_dict = predictions[0]
+", gsub("\\\\", "/", img_path)))
+    
+    # Extract predictions
+    boxes_py <- py$pred_dict$boxes$cpu()$numpy()
+    scores_py <- as.numeric(py$pred_dict$scores$cpu()$numpy())
+    labels_py <- as.integer(py$pred_dict$labels$cpu()$numpy())
+    
+    # Handle empty predictions
+    if (length(scores_py) == 0) {
+      return(list(
+        boxes = matrix(numeric(0), 0, 4),
+        scores = numeric(0),
+        labels = integer(0)
+      ))
+    }
+    
+    # Filter by score threshold
+    keep_idx <- which(scores_py >= score_min)
+    
+    if (length(keep_idx) == 0) {
+      return(list(
+        boxes = matrix(numeric(0), 0, 4),
+        scores = numeric(0),
+        labels = integer(0)
+      ))
+    }
+    
+    # Convert boxes from xyxy to xywh format
+    boxes_xyxy <- boxes_py[keep_idx, , drop = FALSE]
+    boxes_xywh <- cbind(
+      boxes_xyxy[, 1],                      # x
+      boxes_xyxy[, 2],                      # y
+      boxes_xyxy[, 3] - boxes_xyxy[, 1],    # width
+      boxes_xyxy[, 4] - boxes_xyxy[, 2]     # height
+    )
+    
+    return(list(
+      boxes = boxes_xywh,
+      scores = scores_py[keep_idx],
+      labels = labels_py[keep_idx]
+    ))
+    
+  }, error = function(e) {
+    warning("Prediction failed for ", img_path, ": ", e$message)
+    return(list(
+      boxes = matrix(numeric(0), 0, 4),
+      scores = numeric(0),
+      labels = integer(0)
+    ))
+  })
+}
+
+# Test prediction
+cat("Testing prediction on first image...\n")
+test_pred <- predict_one_image(coco_data$images$file_path[1], score_min = 0.5)
+cat(sprintf("  Detected %d objects with score >= 0.5\n", nrow(test_pred$boxes)))
+
+cat("✓ Prediction function ready\n\n")
+
+################################################################################
+# BLOCK 6: IoU Computation and Matching Functions
+################################################################################
+
+cat("Block 6: Defining IoU and matching functions...\n\n")
+
+# Convert bounding box from xywh to xyxy format
+xywh_to_xyxy <- function(box) {
+  # Convert box from (x, y, w, h) to (x1, y1, x2, y2) format
+  c(box[1], box[2], box[1] + box[3], box[2] + box[4])
+}
+
+# Compute Intersection over Union between two boxes
+box_iou <- function(boxA, boxB) {
+  # Compute IoU between two boxes in xywh format.
+  #
+  # Args:
+  #   boxA: Box A as (x, y, w, h)
+  #   boxB: Box B as (x, y, w, h)
+  #
+  # Returns:
+  #   IoU value in [0, 1]
+  
+  A <- xywh_to_xyxy(boxA)
+  B <- xywh_to_xyxy(boxB)
+  
+  # Intersection coordinates
+  ix1 <- max(A[1], B[1])
+  iy1 <- max(A[2], B[2])
+  ix2 <- min(A[3], B[3])
+  iy2 <- min(A[4], B[4])
+  
+  # Intersection area
+  inter_w <- max(0, ix2 - ix1)
+  inter_h <- max(0, iy2 - iy1)
+  inter_area <- inter_w * inter_h
+  
+  # Individual areas
+  areaA <- max(0, (A[3] - A[1]) * (A[4] - A[2]))
+  areaB <- max(0, (B[3] - B[1]) * (B[4] - B[2]))
+  
+  # Union area
+  union_area <- areaA + areaB - inter_area
+  
+  if (union_area <= 0) return(0)
+  
+  inter_area / union_area
+}
+
+# Greedy matching algorithm
+greedy_match <- function(pred_boxes, pred_scores, gt_boxes,
+                         iou_thresh = 0.5, class_aware = FALSE,
+                         pred_labels = NULL, gt_labels = NULL) {
+  # Greedy matching of predictions to ground truth boxes.
+  # Matches are made in order of decreasing prediction confidence.
+  #
+  # Args:
+  #   pred_boxes: N_pred x 4 matrix of prediction boxes (xywh)
+  #   pred_scores: N_pred vector of confidence scores
+  #   gt_boxes: N_gt x 4 matrix of ground truth boxes (xywh)
+  #   iou_thresh: Minimum IoU for a valid match
+  #   class_aware: Whether to require class labels to match
+  #   pred_labels: N_pred vector of predicted class labels
+  #   gt_labels: N_gt vector of ground truth class labels
+  #
+  # Returns:
+  #   List with:
+  #     - matched_pred_idx: Indices of matched predictions
+  #     - matched_gt_idx: Indices of matched ground truth
+  #     - n_matched: Number of matches
+  
+  # Handle empty inputs
+  if (is.null(pred_boxes) || nrow(pred_boxes) == 0 ||
+      is.null(gt_boxes) || nrow(gt_boxes) == 0) {
+    return(list(
+      matched_pred_idx = integer(0),
+      matched_gt_idx = integer(0),
+      n_matched = 0
+    ))
+  }
+  
+  # Sort predictions by score (descending)
+  order_idx <- order(pred_scores, decreasing = TRUE)
+  
+  matched_pred <- integer(0)
+  matched_gt <- integer(0)
+  gt_used <- rep(FALSE, nrow(gt_boxes))
+  
+  # Greedy matching
+  for (pi in order_idx) {
+    best_iou <- 0
+    best_gi <- NA_integer_
+    
+    # Find best matching ground truth for this prediction
+    for (gi in seq_len(nrow(gt_boxes))) {
+      if (gt_used[gi]) next
+      
+      # Class filtering if needed
+      if (class_aware && !is.null(pred_labels) && !is.null(gt_labels)) {
+        if (pred_labels[pi] != gt_labels[gi]) next
+      }
+      
+      # Compute IoU
+      iou <- box_iou(pred_boxes[pi, ], gt_boxes[gi, ])
+      
+      if (iou > best_iou) {
+        best_iou <- iou
+        best_gi <- gi
+      }
+    }
+    
+    # Match if IoU exceeds threshold
+    if (!is.na(best_gi) && best_iou >= iou_thresh) {
+      matched_pred <- c(matched_pred, pi)
+      matched_gt <- c(matched_gt, best_gi)
+      gt_used[best_gi] <- TRUE
+    }
+  }
+  
+  list(
+    matched_pred_idx = matched_pred,
+    matched_gt_idx = matched_gt,
+    n_matched = length(matched_pred)
+  )
+}
+
+# Precision loss function
+precision_loss <- function(n_matched, C_size) {
+  # Compute precision-based loss: 1 - precision.
+  #
+  # Args:
+  #   n_matched: Number of predictions that matched ground truth
+  #   C_size: Total number of predictions
+  #
+  # Returns:
+  #   Loss value in [0, 1]
+  
+  if (C_size == 0) return(1.0)
+  
+  # Ensure n_matched <= C_size
+  n_matched <- min(n_matched, C_size)
+  
+  # Loss = 1 - precision
+  1 - (n_matched / C_size)
+}
+
+cat("✓ IoU and matching functions defined\n\n")
+
+################################################################################
+# BLOCK 7: CRC Calibration
+################################################################################
+
+cat("Block 7: Running CRC calibration...\n\n")
+
+# Set random seed for reproducibility
+set.seed(2025)
+
+# Dataset split
+n_images <- nrow(coco_data$images)
+n_cal <- 1500  # Calibration set size
+cal_idx <- sample(seq_len(n_images), n_cal, replace = FALSE)
+cal_file_paths <- coco_data$images$file_path[cal_idx]
+cal_img_ids <- coco_data$images$image_id[cal_idx]
+
+cat(sprintf("Calibration set: %d images\n", n_cal))
+cat(sprintf("Test set: %d images\n", n_images - n_cal))
+
+# CRC Parameters
+m <- 21                          # Lambda grid size
+Lambda <- seq(0, 1, length.out = m)  # Lambda grid
+alpha <- 0.16                    # Target risk level
+tau_iou <- 0.3                   # IoU threshold for matching
+B <- 1.0                         # Loss upper bound
+verbose <- TRUE
+
+cat("\nCRC Parameters:\n")
+cat(sprintf("  Lambda grid size (m): %d\n", m))
+cat(sprintf("  Target alpha: %.2f\n", alpha))
+cat(sprintf("  IoU threshold: %.2f\n", tau_iou))
+cat(sprintf("  Loss bound (B): %.2f\n", B))
+cat("\n")
+
+# Run inference on calibration set
+cat("Running inference on calibration images...\n")
+cat(sprintf("Estimated time: ~%d-%d minutes\n\n", 
+            round(n_cal * 1.5 / 60), round(n_cal * 3 / 60)))
+
+preds_cache <- vector("list", length = n_cal)
+names(preds_cache) <- as.character(cal_img_ids)
+
+start_time <- Sys.time()
+
+for (i in seq_len(n_cal)) {
+  if (verbose && i %% 50 == 0) {
+    elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+    rate <- i / elapsed
+    remaining <- (n_cal - i) / rate
+    cat(sprintf("  Inference: %d/%d (%.1f%%) - %.1f min elapsed, %.1f min remaining\n",
+                i, n_cal, 100*i/n_cal, elapsed, remaining))
+  }
+  
+  preds_cache[[i]] <- predict_one_image(cal_file_paths[i], score_min = 0.0)
+}
+
+inference_time <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+cat(sprintf("\n✓ Inference complete! Time: %.1f minutes\n\n", inference_time))
+
+# Compute loss matrix
+cat("Computing loss matrix...\n")
+loss_mat <- matrix(NA_real_, nrow = n_cal, ncol = length(Lambda))
+
+for (i in seq_len(n_cal)) {
+  img_id <- cal_img_ids[i]
+  
+  # Get ground truth boxes
+  gt_df <- gt_by_image[[as.character(img_id)]]
+  if (is.null(gt_df) || nrow(gt_df) == 0) {
+    gt_boxes <- matrix(numeric(0), nrow = 0, ncol = 4)
+  } else {
+    gt_boxes <- as.matrix(gt_df[, c("bbox_x", "bbox_y", "bbox_w", "bbox_h")])
+  }
+  
+  # Get predictions
+  preds <- preds_cache[[i]]
+  pred_boxes <- preds$boxes
+  pred_scores <- preds$scores
+  
+  # Compute loss for each lambda
+  for (j in seq_along(Lambda)) {
+    lambda <- Lambda[j]
+    score_thresh <- 1 - lambda
+    
+    # Handle empty predictions
+    if (is.null(pred_scores) || length(pred_scores) == 0 ||
+        is.null(pred_boxes) || nrow(pred_boxes) == 0) {
+      loss_mat[i, j] <- 1.0
+      next
+    }
+    
+    # Filter predictions by threshold
+    C_idx <- which(pred_scores >= score_thresh)
+    C_size <- length(C_idx)
+    
+    if (C_size == 0) {
+      loss_mat[i, j] <- 1.0
+      next
+    }
+    
+    C_boxes <- pred_boxes[C_idx, , drop = FALSE]
+    C_scores <- pred_scores[C_idx]
+    
+    # Match predictions to ground truth
+    match_res <- greedy_match(C_boxes, C_scores, gt_boxes, iou_thresh = tau_iou)
+    
+    n_matched <- if (!is.null(match_res$n_matched)) {
+      match_res$n_matched
+    } else {
+      length(match_res$matched_gt_idx)
+    }
+    
+    # Compute precision loss
+    loss_mat[i, j] <- precision_loss(n_matched, C_size)
+  }
+  
+  if (verbose && i %% 100 == 0) {
+    cat(sprintf("  Loss matrix: %d/%d (%.1f%%)\n", i, n_cal, 100*i/n_cal))
   }
 }
 
-cat("\nModel loaded and tested successfully!\n")
+cat("✓ Loss matrix complete!\n\n")
+
+# Boundedness check
+empirical_max <- max(loss_mat, na.rm = TRUE)
+if (empirical_max > B + 1e-12) {
+  warning(sprintf("Empirical loss max = %.4f exceeds B = %.4f",
+                  empirical_max, B))
+} else {
+  cat(sprintf("✓ Empirical loss max = %.4f <= B = %.4f (OK)\n",
+              empirical_max, B))
+}
+
+# CRC Theorem Selection
+cat("\nApplying CRC theorem...\n")
+
+n <- n_cal
+hat_R_n <- colMeans(loss_mat, na.rm = TRUE)
+lhs_vals <- (n / (n + 1)) * hat_R_n + (B / (n + 1))
+feasible_idx <- which(lhs_vals <= alpha)
+
+if (length(feasible_idx) == 0) {
+  warning("No lambda satisfies the theorem bound <= alpha. Using conservative fallback.")
+  lambda_hat <- max(Lambda)
+  chosen_idx <- which.min(abs(Lambda - lambda_hat))
+} else {
+  chosen_idx <- min(feasible_idx)
+  lambda_hat <- Lambda[chosen_idx]
+  cat(sprintf("✓ Found %d feasible lambdas\n", length(feasible_idx)))
+}
+
+excess_bound <- B * sqrt(log(2 * m) / (2 * n))
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("CRC CALIBRATION RESULTS\n")
+cat(rep("=", 80), "\n", sep = "")
+cat(sprintf("  Chosen lambda: %.4f\n", lambda_hat))
+cat(sprintf("  Score threshold: %.4f\n", 1 - lambda_hat))
+cat(sprintf("  Calibration risk: %.6f\n", hat_R_n[chosen_idx]))
+cat(sprintf("  Excess bound: %.6f\n", excess_bound))
+cat(sprintf("  Theoretical risk bound: %.6f (alpha + excess)\n", alpha + excess_bound))
+cat(sprintf("  Feasible lambdas: %d / %d\n", length(feasible_idx), length(Lambda)))
+cat(rep("=", 80), "\n\n", sep = "")
+
+# Save calibration results
+crc_result <- list(
+  Lambda = Lambda,
+  hat_R_n = hat_R_n,
+  lhs_vals = lhs_vals,
+  B = B,
+  m = m,
+  n = n,
+  lambda_hat = lambda_hat,
+  chosen_idx = chosen_idx,
+  score_threshold = 1 - lambda_hat,
+  excess_bound = excess_bound,
+  loss_mat = loss_mat,
+  calibration_indices = cal_idx,
+  inference_time_minutes = inference_time,
+  alpha = alpha,
+  tau_iou = tau_iou
+)
+
+saveRDS(crc_result, file = file.path(coco_root, "crc_calibration_results.rds"))
+cat("✓ Saved calibration results to: crc_calibration_results.rds\n\n")
+
+################################################################################
+# BLOCK 8: Prepare Test Set
+################################################################################
+
+cat("Block 8: Preparing test set...\n\n")
+
+test_idx <- setdiff(seq_len(n_images), cal_idx)
+
+if (length(test_idx) < 1) {
+  stop("No images left for test after removing calibration set.")
+}
+
+n_test <- length(test_idx)
+test_file_paths <- coco_data$images$file_path[test_idx]
+test_img_ids <- coco_data$images$image_id[test_idx]
+
+cat(sprintf("✓ Test set prepared: %d images\n\n", n_test))
+
+################################################################################
+# BLOCK 9: Test Set Evaluation
+################################################################################
+
+cat("Block 9: Evaluating on test set...\n\n")
+
+cat(sprintf("Estimated time: ~%d-%d minutes\n\n",
+            round(n_test * 1.5 / 60), round(n_test * 3 / 60)))
+
+test_losses <- numeric(length = n_test)
+thr <- 1 - lambda_hat
+
+test_start <- Sys.time()
+
+for (k in seq_along(test_file_paths)) {
+  img_path <- test_file_paths[k]
+  img_id <- test_img_ids[k]
+  
+  if (!file.exists(img_path)) {
+    test_losses[k] <- 1.0
+    next
+  }
+  
+  # Get predictions
+  preds <- predict_one_image(img_path, score_min = 0.0)
+  
+  if (is.null(preds) || is.null(preds$boxes) || nrow(preds$boxes) == 0 ||
+      is.null(preds$scores) || length(preds$scores) == 0) {
+    test_losses[k] <- 1.0
+    next
+  }
+  
+  pred_boxes <- preds$boxes
+  pred_scores <- preds$scores
+  
+  # Apply threshold
+  C_idx <- which(pred_scores >= thr)
+  C_size <- length(C_idx)
+  
+  # Get ground truth
+  gt_df_k <- gt_by_image[[as.character(img_id)]]
+  gt_boxes_k <- if (is.null(gt_df_k) || nrow(gt_df_k) == 0) {
+    matrix(numeric(0), nrow = 0, ncol = 4)
+  } else {
+    as.matrix(gt_df_k[, c("bbox_x", "bbox_y", "bbox_w", "bbox_h")])
+  }
+  
+  if (C_size == 0) {
+    test_losses[k] <- 1.0
+  } else {
+    C_boxes_k <- pred_boxes[C_idx, , drop = FALSE]
+    C_scores_k <- pred_scores[C_idx]
+    
+    match_res_k <- greedy_match(C_boxes_k, C_scores_k, gt_boxes_k, 
+                                iou_thresh = tau_iou)
+    
+    n_matched_k <- if (!is.null(match_res_k$n_matched)) {
+      match_res_k$n_matched
+    } else {
+      length(match_res_k$matched_gt_idx)
+    }
+    
+    test_losses[k] <- precision_loss(n_matched_k, C_size)
+  }
+  
+  if (verbose && k %% 50 == 0) {
+    elapsed <- as.numeric(difftime(Sys.time(), test_start, units = "mins"))
+    rate <- k / elapsed
+    remaining <- (n_test - k) / rate
+    cat(sprintf("  Test eval: %d/%d (%.1f%%) - %.1f min elapsed, %.1f min remaining\n",
+                k, n_test, 100*k/n_test, elapsed, remaining))
+  }
+}
+
+test_time <- as.numeric(difftime(Sys.time(), test_start, units = "mins"))
+empirical_test_risk <- mean(test_losses, na.rm = TRUE)
+
+cat(sprintf("\n✓ Test evaluation complete! Time: %.1f minutes\n\n", test_time))
+
+cat(rep("=", 80), "\n", sep = "")
+cat("TEST SET RESULTS\n")
+cat(rep("=", 80), "\n", sep = "")
+cat(sprintf("Empirical test risk: %.6f\n", empirical_test_risk))
+cat(sprintf("Theoretical bound:   %.6f (alpha + excess)\n", alpha + excess_bound))
+cat(sprintf("Difference:          %.6f\n", empirical_test_risk - (alpha + excess_bound)))
+
+if (empirical_test_risk <= alpha + excess_bound + 1e-12) {
+  cat("\n✓✓✓ BOUND SATISFIED! ✓✓✓\n")
+  cat("The CRC guarantee holds on the test set.\n")
+} else {
+  cat("\n⚠️  Empirical test risk exceeds theoretical bound\n")
+  cat("Consider: increasing n_cal, adjusting alpha, or changing tau_iou\n")
+}
+
+cat(rep("=", 80), "\n\n", sep = "")
+
+# Save test results
+test_result <- list(
+  test_losses = test_losses,
+  empirical_test_risk = empirical_test_risk,
+  n_test = n_test,
+  test_indices = test_idx,
+  test_time_minutes = test_time
+)
+
+saveRDS(test_result, file = file.path(coco_root, "test_results.rds"))
+cat("✓ Saved test results to: test_results.rds\n\n")
+
+################################################################################
+# BLOCK 10: Summary Statistics
+################################################################################
+
+cat("Block 10: Computing summary statistics...\n\n")
+
+cat(rep("=", 80), "\n", sep = "")
+cat("FINAL SUMMARY\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+cat("DATASET:\n")
+cat(sprintf("  Total images: %d\n", n_images))
+cat(sprintf("  Calibration images: %d\n", n_cal))
+cat(sprintf("  Test images: %d\n", n_test))
+
+cat("\nCONFIGURATION:\n")
+cat(sprintf("  Loss function: Precision (1 - precision)\n"))
+cat(sprintf("  Target alpha: %.2f\n", alpha))
+cat(sprintf("  IoU threshold: %.2f\n", tau_iou))
+cat(sprintf("  Lambda grid size (m): %d\n", m))
+cat(sprintf("  Loss bound (B): %.2f\n", B))
+
+cat("\nCALIBRATION:\n")
+cat(sprintf("  Chosen lambda: %.4f\n", lambda_hat))
+cat(sprintf("  Score threshold: %.4f\n", 1 - lambda_hat))
+cat(sprintf("  Calibration risk: %.6f\n", hat_R_n[chosen_idx]))
+cat(sprintf("  Excess bound: %.6f\n", excess_bound))
+cat(sprintf("  Theoretical bound: %.6f\n", alpha + excess_bound))
+cat(sprintf("  Feasible lambdas: %d / %d\n", length(feasible_idx), length(Lambda)))
+
+cat("\nTEST RESULTS:\n")
+cat(sprintf("  Empirical risk: %.6f\n", empirical_test_risk))
+cat(sprintf("  Mean loss: %.6f\n", mean(test_losses)))
+cat(sprintf("  Median loss: %.6f\n", median(test_losses)))
+cat(sprintf("  Std dev: %.6f\n", sd(test_losses)))
+cat(sprintf("  Min loss: %.6f\n", min(test_losses)))
+cat(sprintf("  Max loss: %.6f\n", max(test_losses)))
+
+cat("\nBOUND CHECK:\n")
+cat(sprintf("  Bound satisfied: %s\n",
+            ifelse(empirical_test_risk <= alpha + excess_bound, "YES ✓", "NO ✗")))
+cat(sprintf("  Violation amount: %.6f\n", 
+            max(0, empirical_test_risk - (alpha + excess_bound))))
+
+cat("\nRUNTIME:\n")
+cat(sprintf("  Calibration inference: %.1f minutes\n", inference_time))
+cat(sprintf("  Test evaluation: %.1f minutes\n", test_time))
+cat(sprintf("  Total runtime: %.1f minutes (%.2f hours)\n",
+            inference_time + test_time, (inference_time + test_time) / 60))
+
+cat("\n")
+cat("="*80, "\n\n")
+
+################################################################################
+# BLOCK 11: Visualization
+################################################################################
+
+cat("Block 11: Generating visualizations...\n\n")
+
+# Create output directory for plots
+plots_dir <- file.path(coco_root, "plots")
+dir.create(plots_dir, showWarnings = FALSE)
+
+# Plot 1: Test Loss Distribution
+pdf(file.path(plots_dir, "test_loss_distribution.pdf"), width = 10, height = 6)
+
+hist(test_losses,
+     breaks = 30,
+     main = "Empirical Distribution of Test Loss",
+     xlab = "Loss (1 - Precision)",
+     ylab = "Frequency",
+     col = "skyblue",
+     border = "white",
+     xlim = c(0, 1))
+
+abline(v = mean(test_losses), col = "blue", lwd = 2, lty = 1)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+abline(v = alpha, col = "darkgreen", lwd = 2, lty = 3)
+
+legend("topright",
+       legend = c(
+         sprintf("Empirical mean = %.4f", mean(test_losses)),
+         sprintf("Theoretical bound = %.4f", alpha + excess_bound),
+         sprintf("Target alpha = %.4f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, 2, 3),
+       lwd = 2)
+
+dev.off()
+cat("  ✓ Saved: test_loss_distribution.pdf\n")
+
+# Plot 2: Calibration Risk Curve
+pdf(file.path(plots_dir, "calibration_risk_curve.pdf"), width = 10, height = 6)
+
+plot(Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     xlab = expression(lambda),
+     ylab = "Calibration Risk",
+     main = "Calibration Risk vs Lambda",
+     ylim = c(0, max(hat_R_n) * 1.1))
+
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+legend("topright",
+       legend = c(
+         "Empirical risk",
+         sprintf("Chosen lambda = %.4f", lambda_hat),
+         sprintf("Target alpha = %.2f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, NA, 3),
+       pch = c(19, 19, NA),
+       lwd = 2)
+
+dev.off()
+cat("  ✓ Saved: calibration_risk_curve.pdf\n")
+
+# Plot 3: Score Threshold vs Risk
+pdf(file.path(plots_dir, "threshold_vs_risk.pdf"), width = 10, height = 6)
+
+score_thresholds <- 1 - Lambda
+
+plot(score_thresholds, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     xlab = "Score Threshold",
+     ylab = "Calibration Risk",
+     main = "Detection Threshold vs Risk",
+     xlim = c(0, 1),
+     ylim = c(0, max(hat_R_n) * 1.1))
+
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(1 - lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+legend("topleft",
+       legend = c(
+         "Calibration risk",
+         sprintf("Chosen threshold = %.4f", 1 - lambda_hat),
+         sprintf("Target alpha = %.2f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, NA, 3),
+       pch = c(19, 19, NA),
+       lwd = 2)
+
+dev.off()
+cat("  ✓ Saved: threshold_vs_risk.pdf\n")
+
+# Plot 4: Combined Overview
+pdf(file.path(plots_dir, "crc_overview.pdf"), width = 14, height = 10)
+
+par(mfrow = c(2, 2), mar = c(5, 5, 4, 2))
+
+# Panel 1: Test loss histogram
+hist(test_losses,
+     breaks = 30,
+     main = "Test Loss Distribution",
+     xlab = "Loss",
+     ylab = "Frequency",
+     col = "skyblue",
+     border = "white")
+abline(v = mean(test_losses), col = "blue", lwd = 2)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+
+# Panel 2: Risk vs Lambda
+plot(Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     main = "Risk vs Lambda",
+     xlab = expression(lambda),
+     ylab = "Risk")
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+# Panel 3: Risk vs Threshold
+plot(1 - Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     main = "Risk vs Score Threshold",
+     xlab = "Score Threshold",
+     ylab = "Risk")
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(1 - lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+# Panel 4: CDF
+plot(ecdf(test_losses),
+     main = "Cumulative Distribution",
+     xlab = "Loss",
+     ylab = "CDF",
+     col = "blue",
+     lwd = 2)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+
+dev.off()
+cat("  ✓ Saved: crc_overview.pdf\n")
+
+cat(sprintf("\n✓ All plots saved to: %s\n\n", plots_dir))
+
+################################################################################
+# END OF SCRIPT
+################################################################################
+
+cat(rep("=", 80), "\n", sep = "")
+cat("CRC PIPELINE COMPLETE!\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+cat("All results have been saved to:", coco_root, "\n")
+cat("  - crc_calibration_results.rds (calibration data)\n")
+cat("  - test_results.rds (test evaluation data)\n")
+cat("  - plots/ (visualization PDFs)\n\n")
+
+cat("To reload results in a new session:\n")
+cat("  crc_result <- readRDS('coco_dataset/crc_calibration_results.rds')\n")
+cat("  test_result <- readRDS('coco_dataset/test_results.rds')\n\n")
+
+total_time <- inference_time + test_time
+cat(sprintf("Total pipeline runtime: %.1f minutes (%.2f hours)\n",
+            total_time, total_time / 60))
+
+cat("\n✓ Pipeline completed successfully!\n")
+
+################################################################################
+# Plots
+
+# Interactive plots for your results
+
+# Plot 1: Test Loss Distribution
+windows()  # Opens new plot window
+
+hist(test_losses,
+     breaks = 30,
+     main = "Empirical Distribution of Test Loss",
+     xlab = "Loss (1 - Precision)",
+     ylab = "Frequency",
+     col = "skyblue",
+     border = "white",
+     xlim = c(0, 1))
+
+abline(v = mean(test_losses), col = "blue", lwd = 2, lty = 1)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+abline(v = alpha, col = "darkgreen", lwd = 2, lty = 3)
+
+legend("topright",
+       legend = c(
+         sprintf("Empirical mean = %.4f", mean(test_losses)),
+         sprintf("Theoretical bound = %.4f", alpha + excess_bound),
+         sprintf("Target alpha = %.2f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, 2, 3),
+       lwd = 2,
+       cex = 0.9)
+
+cat("Press Enter for next plot...")
+readline()
+
+# Plot 2: Risk vs Lambda
+windows()
+
+plot(Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     xlab = expression(lambda),
+     ylab = "Calibration Risk",
+     main = "Calibration Risk vs Lambda",
+     ylim = c(0, max(hat_R_n) * 1.1))
+
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+legend("topright",
+       legend = c(
+         "Empirical risk",
+         sprintf("Chosen λ = %.4f", lambda_hat),
+         sprintf("Target α = %.2f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, NA, 3),
+       pch = c(19, 19, NA),
+       lwd = 2)
+
+cat("Press Enter for next plot...")
+readline()
+
+# Plot 3: Score Threshold vs Risk
+windows()
+
+score_thresholds <- 1 - Lambda
+
+plot(score_thresholds, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     xlab = "Score Threshold",
+     ylab = "Calibration Risk",
+     main = "Detection Threshold vs Risk",
+     xlim = c(0, 1),
+     ylim = c(0, max(hat_R_n) * 1.1))
+
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(1 - lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+legend("topleft",
+       legend = c(
+         "Calibration risk",
+         sprintf("Chosen threshold = %.4f", 1 - lambda_hat),
+         sprintf("Target α = %.2f", alpha)
+       ),
+       col = c("blue", "red", "darkgreen"),
+       lty = c(1, NA, 3),
+       pch = c(19, 19, NA),
+       lwd = 2)
+
+cat("Press Enter for next plot...")
+readline()
+
+# Plot 4: Combined 4-Panel Overview
+windows(width = 14, height = 10)
+
+par(mfrow = c(2, 2), mar = c(5, 5, 4, 2))
+
+# Panel 1: Test loss histogram
+hist(test_losses,
+     breaks = 30,
+     main = "Test Loss Distribution",
+     xlab = "Loss",
+     ylab = "Frequency",
+     col = "skyblue",
+     border = "white")
+abline(v = mean(test_losses), col = "blue", lwd = 2)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Mean", "Bound"),
+       col = c("blue", "red"),
+       lty = c(1, 2),
+       lwd = 2,
+       cex = 0.8)
+
+# Panel 2: Risk vs Lambda
+plot(Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     main = "Risk vs Lambda",
+     xlab = expression(lambda),
+     ylab = "Risk")
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+# Panel 3: Risk vs Threshold
+plot(1 - Lambda, hat_R_n,
+     type = "b",
+     pch = 19,
+     col = "blue",
+     lwd = 2,
+     main = "Risk vs Score Threshold",
+     xlab = "Score Threshold",
+     ylab = "Risk")
+abline(h = alpha, col = "darkgreen", lwd = 2, lty = 3)
+points(1 - lambda_hat, hat_R_n[chosen_idx], col = "red", pch = 19, cex = 2)
+
+# Panel 4: CDF
+plot(ecdf(test_losses),
+     main = "Cumulative Distribution",
+     xlab = "Loss",
+     ylab = "CDF",
+     col = "blue",
+     lwd = 2)
+abline(v = alpha + excess_bound, col = "red", lwd = 2, lty = 2)
+abline(v = mean(test_losses), col = "blue", lwd = 2, lty = 1)
+legend("bottomright",
+       legend = c("Empirical CDF", "Mean", "Bound"),
+       col = c("blue", "blue", "red"),
+       lty = c(1, 1, 2),
+       lwd = 2,
+       cex = 0.7)
+
+cat("\n✓ All 4 plots displayed!\n")
+cat("You can save any plot: Right-click -> Save as Image\n")
+
+################################################################################
