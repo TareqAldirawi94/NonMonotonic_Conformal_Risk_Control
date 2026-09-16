@@ -336,7 +336,7 @@ miss_loss <- function(n_matched, n_gt) {
 
 # Soft oversize penalty:
 # zero up to K0, then ramps linearly to 1 over TAU detections
-soft_oversize_penalty <- function(C_size, K0 = 5, TAU = 6) {
+soft_oversize_penalty <- function(C_size, K0 = 3, TAU = 6) {
   oversize_amount <- max(C_size - K0, 0)
   min(oversize_amount / TAU, 1.0)
 }
@@ -344,7 +344,7 @@ soft_oversize_penalty <- function(C_size, K0 = 5, TAU = 6) {
 # Final non-monotonic detection loss:
 # recall improves as lambda grows, but oversized detection sets are penalized
 loss_nonmonotone_detection <- function(n_matched, n_gt, C_size,
-                                       gamma = 0.35, K0 = 5, TAU = 6) {
+                                       gamma = 0.35, K0 = 3, TAU = 6) {
   base_loss <- miss_loss(n_matched, n_gt)
   size_penalty <- soft_oversize_penalty(C_size, K0 = K0, TAU = TAU)
   (1 - gamma) * base_loss + gamma * size_penalty
