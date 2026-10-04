@@ -1,0 +1,271 @@
+# Synthetic multilabel experiment for non-monotone CRC
+
+set.seed(42)
+
+K <- 10
+d <- 15
+n_cal <- 10000
+n_test <- 500
+m <- 100
+alpha <- 0.15
+B <- 1
+n_rep <- 400
+n_boot <- 200
+crc_c_quantile <- 0.90
+
+c0 <- 0.10
+w <- 0.25
+a <- 0.50
+lambda_grid <- seq(0, 1, length.out = m)
+score_noise_sd <- 0.50
+
+sigmoid <- function(x) 1 / (1 + exp(-x))
+clip01 <- function(x, eps = 1e-10) pmin(pmax(x, eps), 1 - eps)
+mono_right <- function(x) rev(cummax(rev(x)))
+
+D_mn <- function(m, n, B = 1) {
+  B * sqrt(log(2 * m) / (2 * n)) +
+    B / (2 * sqrt(2 * n * log(2 * m)))
+}
+
+crc_adjusted_curve <- function(R_hat, n, B = 1) {
+  (n * R_hat + B) / (n + 1)
+}
+
+select_first_feasible <- function(curve_plus, level, fallback_curve) {
+  ok <- which(curve_plus <= level)
+  if (length(ok) > 0) ok[1] else which.min(fallback_curve)
+}
+
+W_true <- matrix(rnorm(d * K, mean = 0, sd = 0.65), nrow = d, ncol = K)
+b_true <- seq(-0.8, 0.8, length.out = K)
+
+generate_split <- function(n) {
+  X <- matrix(rnorm(n * d), nrow = n, ncol = d)
+  eta <- X %*% W_true + matrix(rep(b_true, each = n), nrow = n, ncol = K)
+  p_true <- sigmoid(eta)
+  
+  Y <- matrix(
+    rbinom(n * K, size = 1, prob = as.vector(p_true)),
+    nrow = n,
+    ncol = K
+  )
+  
+  eta_hat <- eta + matrix(
+    rnorm(n * K, mean = 0, sd = score_noise_sd),
+    nrow = n,
+    ncol = K
+  )
+  p_hat <- clip01(sigmoid(eta_hat))
+  
+  list(Y = Y, p_hat = p_hat)
+}
+
+build_loss_matrix <- function(Y, p_hat, lambda_grid) {
+  n <- nrow(Y)
+  K <- ncol(Y)
+  m <- length(lambda_grid)
+  
+  L <- matrix(NA_real_, nrow = n, ncol = m)
+  S <- matrix(NA_real_, nrow = n, ncol = m)
+  
+  for (j in seq_len(m)) {
+    C <- p_hat >= lambda_grid[j]
+    set_size <- rowSums(C)
+    matched <- rowSums(C & (Y == 1))
+    
+    precision <- rep(1, n)
+    nonempty <- set_size > 0
+    precision[nonempty] <- matched[nonempty] / set_size[nonempty]
+    
+    s <- set_size / K
+    penalty <- s * (1 + sin(4 * pi * s)) / 2
+    
+    L[, j] <- c0 + w * (1 - precision) + a * penalty
+    S[, j] <- set_size
+  }
+  
+  list(loss = L, size = S)
+}
+
+bootstrap_beta_hat <- function(L_cal, n_boot = 200, q = 0.90) {
+  n <- nrow(L_cal)
+  R_full <- colMeans(L_cal)
+  deviations <- numeric(n_boot)
+  
+  for (b in seq_len(n_boot)) {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    R_boot <- colMeans(L_cal[idx, , drop = FALSE])
+    deviations[b] <- max(abs(R_boot - R_full))
+  }
+  
+  as.numeric(quantile(deviations, probs = q, names = FALSE, type = 8))
+}
+
+select_methods <- function(L_cal) {
+  n <- nrow(L_cal)
+  m <- ncol(L_cal)
+  R_hat <- colMeans(L_cal)
+  R_plus <- crc_adjusted_curve(R_hat, n, B)
+  
+  idx_crc <- select_first_feasible(R_plus, alpha, R_hat)
+  
+  beta_hat <- bootstrap_beta_hat(L_cal, n_boot, crc_c_quantile)
+  alpha_c <- max(alpha - beta_hat, 0.01)
+  idx_crcc <- select_first_feasible(R_plus, alpha_c, R_hat)
+  
+  L_mono <- t(apply(L_cal, 1, mono_right))
+  R_loss_mono <- colMeans(L_mono)
+  R_loss_mono_plus <- crc_adjusted_curve(R_loss_mono, n, B)
+  idx_lossmono <- select_first_feasible(
+    R_loss_mono_plus, alpha, R_loss_mono
+  )
+  
+  R_risk_mono <- mono_right(R_hat)
+  R_risk_mono_plus <- crc_adjusted_curve(R_risk_mono, n, B)
+  idx_riskmono <- select_first_feasible(
+    R_risk_mono_plus, alpha, R_risk_mono
+  )
+  
+  D <- D_mn(m, n, B)
+  alpha_nm <- alpha - D
+  idx_crcnm <- select_first_feasible(R_plus, alpha_nm, R_hat)
+  
+  c(
+    "CRC" = idx_crc,
+    "CRC-C" = idx_crcc,
+    "Loss Mono" = idx_lossmono,
+    "Risk Mono" = idx_riskmono,
+    "CRC-NM" = idx_crcnm
+  )
+}
+
+run_one_rep <- function(rep_id) {
+  cal <- generate_split(n_cal)
+  tst <- generate_split(n_test)
+  
+  cal_obj <- build_loss_matrix(cal$Y, cal$p_hat, lambda_grid)
+  tst_obj <- build_loss_matrix(tst$Y, tst$p_hat, lambda_grid)
+  
+  idx <- select_methods(cal_obj$loss)
+  method_names <- names(idx)
+  
+  out <- data.frame(
+    rep = rep_id,
+    method = method_names,
+    index = as.integer(idx),
+    lambda = lambda_grid[as.integer(idx)],
+    test_risk = NA_real_,
+    set_size = NA_real_,
+    violation = NA_integer_,
+    stringsAsFactors = FALSE
+  )
+  
+  for (k in seq_along(method_names)) {
+    j <- as.integer(idx[k])
+    out$test_risk[k] <- mean(tst_obj$loss[, j])
+    out$set_size[k] <- mean(tst_obj$size[, j])
+    out$violation[k] <- as.integer(out$test_risk[k] > alpha)
+  }
+  
+  out
+}
+
+sanity <- generate_split(2000)
+sanity_obj <- build_loss_matrix(sanity$Y, sanity$p_hat, lambda_grid)
+
+cat("Loss range:\n")
+print(range(sanity_obj$loss))
+cat("Terminal loss range:\n")
+print(range(sanity_obj$loss[, m]))
+cat("Theoretical bounds:\n")
+print(c(lower = c0, upper = c0 + w + a))
+
+stopifnot(min(sanity_obj$loss) >= -1e-12)
+stopifnot(max(sanity_obj$loss) <= 1 + 1e-12)
+stopifnot(max(abs(sanity_obj$loss[, m] - c0)) < 1e-10)
+stopifnot(c0 <= alpha)
+
+results_list <- vector("list", n_rep)
+
+for (r in seq_len(n_rep)) {
+  if (r %% 10 == 0) cat("Completed", r, "of", n_rep, "\n")
+  results_list[[r]] <- run_one_rep(r)
+}
+
+results <- do.call(rbind, results_list)
+
+method_order <- c("CRC", "CRC-C", "Loss Mono", "Risk Mono", "CRC-NM")
+results$method <- factor(results$method, levels = method_order)
+
+summary_table <- do.call(
+  rbind,
+  lapply(method_order, function(mm) {
+    z <- results[results$method == mm, , drop = FALSE]
+    data.frame(
+      method = mm,
+      mean_risk = mean(z$test_risk),
+      sd_risk = sd(z$test_risk),
+      violation_pct = 100 * mean(z$violation),
+      mean_set_size = mean(z$set_size),
+      sd_set_size = sd(z$set_size)
+    )
+  })
+)
+
+print(summary_table, row.names = FALSE, digits = 4)
+
+write.csv(results, "synthetic_nonmonotone_raw_results.csv", row.names = FALSE)
+write.csv(summary_table, "synthetic_nonmonotone_summary.csv", row.names = FALSE)
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("Install ggplot2 with install.packages('ggplot2')")
+}
+library(ggplot2)
+
+p_risk <- ggplot(results, aes(x = method, y = test_risk)) +
+  geom_boxplot(outlier.size = 0.45, width = 0.65) +
+  geom_hline(yintercept = alpha, linetype = "dashed", linewidth = 0.6) +
+  labs(x = NULL, y = "Test risk") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+p_size <- ggplot(results, aes(x = method, y = set_size)) +
+  geom_boxplot(outlier.size = 0.45, width = 0.65) +
+  labs(x = NULL, y = "Prediction set size") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+ggsave("02_test_risk_synthatic.png", p_risk, width = 5.8, height = 4.2, dpi = 300)
+ggsave("03_set_size_synthatic.png", p_size, width = 5.8, height = 4.2, dpi = 300)
+
+
+suppressWarnings(suppressMessages(library(ggplot2)))
+
+alpha <- 0.15
+res <- read.csv("synthetic_nonmonotone_raw_results.csv", stringsAsFactors = FALSE)
+res$method <- factor(res$method, levels = c("CRC","CRC-C","Loss Mono","Risk Mono","CRC-NM"))
+
+cols <- c("CRC"="#8fb8de","CRC-C"="#6fbf9f","Loss Mono"="#b9a7d0",
+          "Risk Mono"="#e8c07d","CRC-NM"="#e8998d")
+
+## Panel 1: test risk densities
+p1 <- ggplot(res, aes(x = test_risk, fill = method, color = method)) +
+  geom_density(alpha = 0.45, linewidth = 0.4) +
+  geom_vline(xintercept = alpha, linetype = "dashed", color = "grey30") +
+  annotate("text", x = alpha, y = Inf, label = paste0("alpha == ", alpha),
+           parse = TRUE, vjust = 1.6, hjust = -0.05, size = 4) +
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) +
+  labs(x = "Test risk", y = "Density", fill = NULL, color = NULL) +
+  theme_minimal(base_size = 13) + theme(legend.position = "top")
+ggsave("figs/02_test_risk_synthatic.png", p1, width = 7.0, height = 4.2, dpi = 300)
+
+## Panel 2: prediction-set-size densities
+p2 <- ggplot(res, aes(x = set_size, fill = method, color = method)) +
+  geom_density(alpha = 0.45, linewidth = 0.4) +
+  scale_fill_manual(values = cols) + scale_color_manual(values = cols) +
+  labs(x = "Prediction set size", y = "Density", fill = NULL, color = NULL) +
+  theme_minimal(base_size = 13) + theme(legend.position = "top")
+ggsave("figs/03_set_size_synthatic.png", p2, width = 7.0, height = 4.2, dpi = 300)
+
+cat("Saved figs/02_test_risk_synthatic.png and figs/03_set_size_synthatic.png\n")
